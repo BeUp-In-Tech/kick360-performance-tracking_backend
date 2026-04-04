@@ -19,8 +19,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Kick 360 Backend",
-    description="Local Testing Version",
-    version="1.0.0",
+    description="Optimized Cloud Version",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -31,7 +31,7 @@ analytics = SoccerAnalytics()
 async def health_check():
     return {
         "status": "online",
-        "message": "Local server running!",
+        "message": "Kick 360 Backend is running!",
         "docs": "/docs"
     }
 
@@ -49,6 +49,7 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
     file_path = os.path.join(upload_dir, file.filename)
 
+    # Save video
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -58,9 +59,19 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
     duration_seconds = round(frame_count / fps, 2) if fps > 0 else 0
 
+    # ✅ LIMIT VIDEO LENGTH (prevents timeout)
+    if duration_seconds > 15:
+        cap.release()
+        background_tasks.add_task(remove_file, file_path)
+        return {
+            "status": "error",
+            "message": "Video too long. Max allowed is 15 seconds."
+        }
+
     final_output = {}
 
-    frame_skip = 2
+    # ✅ HEAVY OPTIMIZATION
+    frame_skip = 5   # reduce load
     frame_index = 0
 
     while cap.isOpened():
@@ -72,7 +83,11 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
         if frame_index % frame_skip != 0:
             continue
 
-        results = model(frame, verbose=False, conf=0.25, imgsz=640)[0]
+        # ✅ Resize frame (huge performance boost)
+        frame = cv2.resize(frame, (640, 360))
+
+        # ✅ Lighter YOLO inference
+        results = model(frame, verbose=False, conf=0.3, imgsz=480)[0]
         detections = sv.Detections.from_ultralytics(results)
 
         player_detections = tracker.update_with_detections(
@@ -89,6 +104,7 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
     cap.release()
 
+    # ✅ cleanup
     background_tasks.add_task(remove_file, file_path)
 
     return {
@@ -101,5 +117,3 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
         "players_detected": len(final_output),
         "analysis": final_output
     }
-
-
