@@ -4,20 +4,21 @@ import shutil
 import os
 import numpy as np
 import time
+import gc
 from ultralytics import YOLO
 import supervision as sv
 from engine import SoccerAnalytics
 from contextlib import asynccontextmanager
 
 # =========================
-# CONFIG (VERY IMPORTANT)
+# CONFIG
 # =========================
-MAX_VIDEO_DURATION = 6   # seconds
-MAX_PROCESS_TIME = 8     # seconds
-MAX_FRAMES = 12          # total frames to process
+PROCESS_SECONDS = 5      # only process first 5 seconds
+MAX_FRAMES = 5           # max frames to process
+MAX_PROCESS_TIME = 6     # safety timeout
 
 # =========================
-# LOAD MODEL (SAFE)
+# MODEL LOAD
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -25,11 +26,10 @@ async def lifespan(app: FastAPI):
     app.state.model = YOLO("yolov8n.pt")
     print("✅ Model loaded!")
     yield
-    print("🛑 Shutting down...")
 
 app = FastAPI(
-    title="Kick 360 Backend (Render Optimized)",
-    version="2.0.0",
+    title="Kick 360 Backend (Smart Processing)",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -37,15 +37,11 @@ tracker = sv.ByteTrack()
 analytics = SoccerAnalytics()
 
 # =========================
-# HEALTH CHECK
+# HEALTH
 # =========================
 @app.get("/")
 async def health_check():
-    return {
-        "status": "online",
-        "message": "Kick 360 backend running (optimized)",
-        "docs": "/docs"
-    }
+    return {"status": "online", "message": "Smart backend running"}
 
 # =========================
 # CLEANUP
@@ -55,7 +51,7 @@ def remove_file(path: str):
         os.remove(path)
 
 # =========================
-# MAIN ANALYSIS
+# ANALYZE
 # =========================
 @app.post("/analyze/")
 async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -67,7 +63,6 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
 
     file_path = os.path.join(upload_dir, file.filename)
 
-    # Save file
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
@@ -76,25 +71,16 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
 
-    duration_seconds = round(frame_count / fps, 2) if fps > 0 else 0
-
-    # =========================
-    # 🚨 LIMIT VIDEO LENGTH
-    # =========================
-    if duration_seconds > MAX_VIDEO_DURATION:
-        cap.release()
-        background_tasks.add_task(remove_file, file_path)
-        return {
-            "status": "error",
-            "message": f"Video too long. Max allowed is {MAX_VIDEO_DURATION} seconds."
-        }
+    duration_seconds = frame_count / fps if fps > 0 else 0
 
     final_output = {}
 
     # =========================
-    # FRAME SAMPLING (IMPORTANT)
+    # 🎯 PROCESS ONLY FIRST N SECONDS
     # =========================
-    frame_interval = max(1, int(frame_count / MAX_FRAMES))
+    max_frames_to_read = int(fps * PROCESS_SECONDS)
+
+    frame_interval = max(1, int(max_frames_to_read / MAX_FRAMES))
 
     frame_index = 0
     processed_frames = 0
@@ -106,9 +92,12 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
         if not ret:
             break
 
-        # ⏱ TIME LIMIT (prevents 502)
+        # stop after N seconds
+        if frame_index >= max_frames_to_read:
+            break
+
+        # time safety
         if time.time() - start_time > MAX_PROCESS_TIME:
-            print("⏹ Time limit reached, stopping early")
             break
 
         if frame_index % frame_interval != 0:
@@ -118,15 +107,11 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
         frame_index += 1
         processed_frames += 1
 
-        # =========================
-        # 🔥 REDUCE VIDEO QUALITY
-        # =========================
-        frame = cv2.resize(frame, (256, 144))
+        # 🔻 downscale
+        frame = cv2.resize(frame, (192, 108))
 
-        # =========================
-        # LIGHT YOLO
-        # =========================
-        results = model(frame, verbose=False, conf=0.5, imgsz=256)[0]
+        # 🔻 light inference
+        results = model(frame, verbose=False, conf=0.6, imgsz=192)[0]
         detections = sv.Detections.from_ultralytics(results)
 
         player_detections = tracker.update_with_detections(
@@ -147,15 +132,11 @@ async def analyze_video(background_tasks: BackgroundTasks, file: UploadFile = Fi
     cap.release()
     background_tasks.add_task(remove_file, file_path)
 
-    # =========================
-    # RESPONSE (LIGHTWEIGHT)
-    # =========================
+    gc.collect()
+
     return {
         "status": "success",
-        "video_info": {
-            "duration_sec": duration_seconds,
-            "processed_frames": processed_frames
-        },
-        "players_detected": len(final_output),
-        "analysis": final_output
+        "video_duration": round(duration_seconds, 2),
+        "processed_seconds": PROCESS_SECONDS,
+        "players_detected": len(final_output)
     }
